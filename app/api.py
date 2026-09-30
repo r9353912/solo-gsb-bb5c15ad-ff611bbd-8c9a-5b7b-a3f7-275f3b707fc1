@@ -12,6 +12,7 @@ from .models import (
     CertCorrectRequest,
     CertIssueRequest,
     CertRevokeRequest,
+    ReadingAdjudicateRequest,
     ReadingSubmitRequest,
     UtcDatetime,
 )
@@ -27,11 +28,15 @@ def health() -> dict:
 
 @router.get("/status")
 def status() -> dict:
-    """服务总览：当前单调版本与结论枚举。"""
+    """服务总览：当前单调版本、结论枚举与裁决状态枚举。"""
     with get_conn() as conn:
         return {
             "current_version": service.current_version(conn),
             "conclusion_statuses": list(service.CONCLUSIONS),
+            "adjudication_states": [
+                service.ADJUDICATION_EFFECTIVE,
+                service.ADJUDICATION_INVALIDATED,
+            ],
         }
 
 
@@ -97,6 +102,21 @@ def certificate_history(certificate_no: str) -> dict:
 @router.post("/readings")
 def submit_readings(req: ReadingSubmitRequest) -> dict:
     return service.submit_readings(req.model_dump())
+
+
+@router.post("/readings/{reading_no}/adjudicate")
+def adjudicate_reading(reading_no: str, req: ReadingAdjudicateRequest) -> dict:
+    """对处于 review 的读数进行人工选证裁决。
+
+    成功裁决占用一个全局版本；相同 request_id+内容重复提交沿用首次结果，
+    异内容冲突（409）。依据版本不等于当前版本、读数非 review、所选版本
+    不是测量时刻候选等情况一律拒绝，不产生新版本。
+    """
+    data = req.model_dump()
+    if data["reading_no"] != reading_no:
+        raise ApiError(422, "path_body_mismatch",
+                       "reading_no in path and body must match")
+    return service.adjudicate_reading(data)
 
 
 @router.get("/readings")

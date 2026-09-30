@@ -3,31 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import pathlib
 
 import pytest
 
-# 必须在导入应用代码前设置数据库路径
-DB_PATH = "/tmp/trace_test_%d.db" % os.getpid()
-for suffix in ("", "-wal", "-shm"):
-    p = pathlib.Path(DB_PATH + suffix)
-    if p.exists():
-        p.unlink()
-os.environ["TRACE_DB_PATH"] = DB_PATH
-
-from fastapi.testclient import TestClient  # noqa: E402
-
-from app.config import reset_settings_cache  # noqa: E402
-from app.main import app  # noqa: E402
-
-
-@pytest.fixture(scope="module")
-def client():
-    reset_settings_cache()
-    with TestClient(app) as c:
-        yield c
-
+DB_BASENAME = "trace_test_api"
 
 API = "/api/v1"
 

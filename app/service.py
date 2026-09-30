@@ -263,6 +263,21 @@ def certificate_history(conn: sqlite3.Connection, certificate_no: str) -> Dict[s
 
 # ---------------------------------------------------------------- 读数评估
 
+def _evaluate_candidate_rows(
+    matches: List[sqlite3.Row],
+    value: float,
+    snapshot_fn,
+) -> Dict[str, Any]:
+    """按候选证书行集合给出自动结论；snapshot_fn 决定证书快照的版本视角投影。"""
+    if not matches:
+        return {"status": "unverified", "reliance": None, "candidates": []}
+    candidates = [snapshot_fn(m) for m in matches]
+    if len(matches) > 1:
+        return {"status": "review", "reliance": None, "candidates": candidates}
+    status = "conforming" if matches[0]["min_value"] <= value <= matches[0]["max_value"] else "out_of_range"
+    return {"status": status, "reliance": candidates[0], "candidates": candidates}
+
+
 def evaluate_reading(
     conn: sqlite3.Connection,
     device_no: str,
@@ -270,25 +285,145 @@ def evaluate_reading(
     value: float,
     at_version: int,
 ) -> Dict[str, Any]:
-    """在指定版本视角下评估单条读数（不依赖读数是否已入库）。"""
+    """在指定版本视角下评估单条读数的**自动结论**（不含人工裁决，不依赖读数是否入库）。"""
     matches = _active_cert_rows(conn, device_no, at_version, measured_at)
-    if not matches:
-        return {"status": "unverified", "reliance": None, "candidates": []}
-    if len(matches) > 1:
-        return {
-            "status": "review",
-            "reliance": None,
-            "candidates": [_cert_snapshot(m) for m in matches],
-        }
-    cert = matches[0]
-    status = "conforming" if cert["min_value"] <= value <= cert["max_value"] else "out_of_range"
-    return {"status": status, "reliance": _cert_snapshot(cert), "candidates": [_cert_snapshot(cert)]}
+    return _evaluate_candidate_rows(matches, value, _cert_snapshot)
+
+
+# ---------------------------------------------------------------- 人工选证裁决
+
+ADJUDICATION_EFFECTIVE = "effective"
+ADJUDICATION_INVALIDATED = "invalidated"
+
+
+def _latest_adjudication_row(
+    conn: sqlite3.Connection, reading_no: str, at_version: int
+) -> Optional[sqlite3.Row]:
+    """该读数在 at_version 视角下最近登记的一条裁决（含已失效），无则 None。"""
+    return conn.execute(
+        "SELECT * FROM reading_adjudications"
+        " WHERE reading_no=? AND decided_at_version <= ?"
+        " ORDER BY decided_at_version DESC LIMIT 1",
+        (reading_no, at_version),
+    ).fetchone()
+
+
+def _adjudication_view(
+    conn: sqlite3.Connection,
+    reading: sqlite3.Row,
+    row: sqlite3.Row,
+    at_version: int,
+    snapshot_fn,
+) -> Dict[str, Any]:
+    """裁决的版本视角呈现：所选证书版本在该视角仍有效即生效，否则标明已失效。"""
+    invalidated_at = row["invalidated_at_version"]
+    is_invalidated = invalidated_at is not None and invalidated_at <= at_version
+
+    # 裁决依据按裁决时所依据的 base_version 视角冻结（候选闭集 + 所选证书闭区间）
+    base = int(row["base_version"])
+    base_matches = _active_cert_rows(
+        conn, reading["device_no"], base, reading["measured_at"]
+    )
+    basis_candidates = [snapshot_fn(m, base) for m in base_matches]
+    selected = next(
+        (
+            c for c in basis_candidates
+            if c["certificate_no"] == row["selected_certificate_no"]
+            and c["version_seq"] == row["selected_version_seq"]
+        ),
+        None,
+    )
+
+    invalidated_by = None
+    if is_invalidated:
+        ev = conn.execute(
+            "SELECT event_type FROM versions WHERE version=?",
+            (invalidated_at,),
+        ).fetchone()
+        invalidated_by = ev["event_type"] if ev is not None else None
+
+    return {
+        "state": ADJUDICATION_INVALIDATED if is_invalidated else ADJUDICATION_EFFECTIVE,
+        "decided_at_version": int(row["decided_at_version"]),
+        "base_version": base,
+        "selected_certificate_no": row["selected_certificate_no"],
+        "selected_version_seq": int(row["selected_version_seq"]),
+        "reason": row["reason"],
+        "invalidated_at_version": invalidated_at if is_invalidated else None,
+        "invalidated_by_event": invalidated_by,
+        "basis": {
+            "base_version": base,
+            "selected_certificate_no": row["selected_certificate_no"],
+            "selected_version_seq": int(row["selected_version_seq"]),
+            "candidate_count": len(basis_candidates),
+            "candidates": basis_candidates,
+        },
+        "selected_certificate": selected,
+    }
+
+
+def evaluate_reading_presented(
+    conn: sqlite3.Connection,
+    reading: sqlite3.Row,
+    at_version: int,
+    snapshot_fn=None,
+    with_adjudication: bool = False,
+) -> Dict[str, Any]:
+    """读数在 at_version 视角的**呈现结论**：人工裁决生效则覆盖自动结论。
+
+    snapshot_fn(row, at_version) 用于证书快照的版本视角投影——
+    普通查询用真实快照，取证包用 as-of 投影（不携带"未来"失效事件）。
+    返回含 status/reliance/candidates，with_adjudication 时另带 adjudication。
+    """
+    if snapshot_fn is None:
+        snapshot_fn = lambda m, av: _cert_snapshot(m)  # noqa: E731
+
+    auto = _evaluate_candidate_rows(
+        _active_cert_rows(conn, reading["device_no"], at_version, reading["measured_at"]),
+        reading["value"],
+        lambda m: snapshot_fn(m, at_version),
+    )
+    adj_row = _latest_adjudication_row(conn, reading["reading_no"], at_version)
+    adj_view: Optional[Dict[str, Any]] = None
+    if adj_row is not None:
+        adj_view = _adjudication_view(conn, reading, adj_row, at_version, snapshot_fn)
+        if adj_view["state"] == ADJUDICATION_EFFECTIVE and adj_view["selected_certificate"] is not None:
+            sel = adj_view["selected_certificate"]
+            auto = {
+                "status": (
+                    "conforming"
+                    if sel["min_value"] <= reading["value"] <= sel["max_value"]
+                    else "out_of_range"
+                ),
+                "reliance": sel,
+                "candidates": adj_view["basis"]["candidates"],
+            }
+    if with_adjudication:
+        auto["adjudication"] = adj_view
+    return auto
+
+
+def _invalidate_adjudications_for_version(
+    conn: sqlite3.Connection, certificate_no: str, version_seq: int, at_version: int
+) -> int:
+    """所选证书版本被纠正/撤销时，把依赖它的生效裁决标记失效（只追加登记）。"""
+    cur = conn.execute(
+        "UPDATE reading_adjudications SET invalidated_at_version=?"
+        " WHERE selected_certificate_no=? AND selected_version_seq=?"
+        " AND invalidated_at_version IS NULL",
+        (at_version, certificate_no, version_seq),
+    )
+    return cur.rowcount
 
 
 def _evaluate_affected(
     conn: sqlite3.Connection, before_version: int, new_version: int, device_nos: Tuple[str, ...]
 ) -> List[Dict[str, Any]]:
-    """重算在 before_version 之前（含）提交、且设备相关的所有读数的结论变化。"""
+    """重算在 before_version 之前（含）提交、且设备相关的所有读数的结论变化。
+
+    前后结论均按"呈现口径"（含人工裁决覆盖）评估；本次事件使裁决失效的，
+    额外给出 adjudication_invalidated 标记。
+    """
     if not device_nos:
         return []
     placeholders = ",".join("?" for _ in device_nos)
@@ -299,8 +434,17 @@ def _evaluate_affected(
     ).fetchall()
     affected: List[Dict[str, Any]] = []
     for r in rows:
-        before = evaluate_reading(conn, r["device_no"], r["measured_at"], r["value"], before_version)
-        after = evaluate_reading(conn, r["device_no"], r["measured_at"], r["value"], new_version)
+        before = evaluate_reading_presented(conn, r, before_version, with_adjudication=True)
+        after = evaluate_reading_presented(conn, r, new_version, with_adjudication=True)
+        before_adj = before.pop("adjudication")
+        after_adj = after.pop("adjudication")
+        invalidated = (
+            before_adj is not None
+            and before_adj["state"] == ADJUDICATION_EFFECTIVE
+            and after_adj is not None
+            and after_adj["state"] == ADJUDICATION_INVALIDATED
+            and (after_adj["invalidated_at_version"] or 0) == new_version
+        )
         affected.append({
             "reading_no": r["reading_no"],
             "device_no": r["device_no"],
@@ -309,6 +453,7 @@ def _evaluate_affected(
             "before": {"at_version": before_version, **before},
             "after": {"at_version": new_version, **after},
             "conclusion_changed": before["status"] != after["status"],
+            "adjudication_invalidated": invalidated,
         })
     return affected
 
@@ -404,6 +549,10 @@ def correct_certificate(data: Dict[str, Any]) -> Dict[str, Any]:
                     "UPDATE certificate_versions SET superseded_at_version=? WHERE id=?",
                     (version, old_row["id"]),
                 )
+                # 依赖该旧版本的生效裁决随其失效，读数回到自动结论
+                _invalidate_adjudications_for_version(
+                    conn, payload["certificate_no"], old_seq, version
+                )
                 conn.execute(
                     "INSERT INTO certificate_versions (certificate_no, version_seq,"
                     " device_no, valid_from, valid_to, min_value, max_value, created_at_version)"
@@ -464,6 +613,10 @@ def revoke_certificate(data: Dict[str, Any]) -> Dict[str, Any]:
                 conn.execute(
                     "UPDATE certificate_versions SET superseded_at_version=? WHERE id=?",
                     (version, cur_row["id"]),
+                )
+                # 依赖被撤销版本的生效裁决随其失效
+                _invalidate_adjudications_for_version(
+                    conn, payload["certificate_no"], cur_seq, version
                 )
                 conn.execute(
                     "UPDATE certificates SET is_revoked=1, revoked_at_version=?,"
@@ -551,6 +704,128 @@ def submit_readings(data: Dict[str, Any]) -> Dict[str, Any]:
             return _replay_response(request_id)
 
 
+# ------------------------------------------------- 写操作：人工选证裁决
+
+def adjudicate_reading(data: Dict[str, Any]) -> Dict[str, Any]:
+    request_id = data["request_id"]
+    payload = {
+        "reading_no": data["reading_no"],
+        "certificate_no": data["certificate_no"],
+        "version_seq": int(data["version_seq"]),
+        "base_version": int(data["base_version"]),
+        "reason": data.get("reason"),
+    }
+
+    while True:
+        try:
+            with write_tx() as conn:
+                latest = current_version(conn)
+
+                # 幂等优先：BEGIN IMMEDIATE 已持写锁，先判 request_id 复用，
+                # 再做业务校验，最后登记版本；任何失败整体回滚不产生新版本。
+                body = canonical_json(payload)
+                existing_req = conn.execute(
+                    "SELECT fingerprint FROM versions WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
+                if existing_req is not None:
+                    if existing_req["fingerprint"] != body:
+                        raise ApiError(
+                            409,
+                            "request_id_conflict",
+                            f"request_id {request_id!r} was already used with different content",
+                        )
+                    raise _Replay("reading_adjudicate")
+
+                # 依据版本必须是当前全局版本；不一致拒绝且不产生新版本（乐观并发控制）
+                if payload["base_version"] != latest:
+                    raise ApiError(
+                        409,
+                        "base_version_stale",
+                        f"base_version {payload['base_version']} is not the current"
+                        f" global version {latest}; refetch and retry",
+                    )
+
+                reading = conn.execute(
+                    "SELECT * FROM readings WHERE reading_no=?",
+                    (payload["reading_no"],),
+                ).fetchone()
+                if reading is None:
+                    raise ApiError(
+                        404,
+                        "unknown_reading",
+                        f"reading {payload['reading_no']!r} not found",
+                    )
+
+                # 裁决所依据的是 base_version 视角下的自动结论；必须是 review（多候选）
+                base_conclusion = evaluate_reading(
+                    conn, reading["device_no"], reading["measured_at"],
+                    reading["value"], payload["base_version"],
+                )
+                if base_conclusion["status"] != "review":
+                    raise ApiError(
+                        409,
+                        "reading_not_in_review",
+                        f"reading {payload['reading_no']!r} is {base_conclusion['status']!r}"
+                        " at base_version; only review readings can be adjudicated",
+                    )
+
+                # 所选版本必须是该读数测量时刻、base_version 视角下的候选证书之一
+                selected_row = _cert_version_row(
+                    conn, payload["certificate_no"], payload["version_seq"]
+                )
+                candidate_keys = {
+                    (c["certificate_no"], c["version_seq"])
+                    for c in base_conclusion["candidates"]
+                }
+                if (
+                    selected_row is None
+                    or (selected_row["certificate_no"], selected_row["version_seq"])
+                    not in candidate_keys
+                ):
+                    raise ApiError(
+                        422,
+                        "target_mismatch",
+                        "selected certificate version must be one of the reading's"
+                        " candidates at the measurement time as of base_version",
+                    )
+
+                version = _insert_version(conn, "reading_adjudicate", request_id, payload)
+                conn.execute(
+                    "INSERT INTO reading_adjudications (reading_no, decided_at_version,"
+                    " base_version, selected_certificate_no, selected_version_seq, reason)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (
+                        payload["reading_no"], version, payload["base_version"],
+                        payload["certificate_no"], payload["version_seq"], payload["reason"],
+                    ),
+                )
+
+                presented = evaluate_reading_presented(
+                    conn, reading, version, with_adjudication=True
+                )
+                response = {
+                    "version": version,
+                    "request_id": request_id,
+                    "event_type": "reading_adjudicate",
+                    "idempotent_replay": False,
+                    "reading_no": payload["reading_no"],
+                    "device_no": reading["device_no"],
+                    "measured_at": reading["measured_at"],
+                    "value": reading["value"],
+                    "submitted_at_version": reading["submitted_at_version"],
+                    "at_version": version,
+                    "status": presented["status"],
+                    "reliance": presented["reliance"],
+                    "candidates": presented["candidates"],
+                    "adjudication": presented["adjudication"],
+                }
+                _save_response(conn, version, response)
+                return response
+        except _Replay:
+            return _replay_response(request_id)
+
+
 # ---------------------------------------------------------------- 读接口
 
 def get_reading(
@@ -567,7 +842,9 @@ def get_reading(
             f"reading was submitted at version {row['submitted_at_version']},"
             f" cannot evaluate at earlier version {av}",
         )
-    conclusion = evaluate_reading(conn, row["device_no"], row["measured_at"], row["value"], av)
+    conclusion = evaluate_reading_presented(
+        conn, row, av, with_adjudication=True
+    )
     return {
         "reading_no": row["reading_no"],
         "device_no": row["device_no"],
@@ -601,7 +878,7 @@ def list_readings(
     rows = rows[:limit]
     items = []
     for r in rows:
-        c = evaluate_reading(conn, r["device_no"], r["measured_at"], r["value"], av)
+        c = evaluate_reading_presented(conn, r, av, with_adjudication=True)
         if status_filter and c["status"] != status_filter:
             continue
         items.append({
@@ -682,26 +959,26 @@ def _cert_snapshot_as_of(row: sqlite3.Row, at_version: int) -> Dict[str, Any]:
     return snap
 
 
+def _audit_snapshot_fn(row: sqlite3.Row, at_version: int) -> Dict[str, Any]:
+    """取证包专用的证书快照版本视角投影（不携带晚于取证版本的失效事件）。"""
+    return _cert_snapshot_as_of(row, at_version)
+
+
 def _evaluate_reading_as_of(
     conn: sqlite3.Connection,
-    device_no: str,
-    measured_at: str,
-    value: float,
+    reading: sqlite3.Row,
     at_version: int,
 ) -> Dict[str, Any]:
-    """版本视角下评估读数，候选证书快照统一做 as-of 投影。"""
-    matches = _active_cert_rows(conn, device_no, at_version, measured_at)
-    if not matches:
-        return {"status": "unverified", "reliance": None, "candidates": []}
-    candidates = [_cert_snapshot_as_of(m, at_version) for m in matches]
-    if len(matches) > 1:
-        return {"status": "review", "reliance": None, "candidates": candidates}
-    status = (
-        "conforming"
-        if matches[0]["min_value"] <= value <= matches[0]["max_value"]
-        else "out_of_range"
+    """版本视角下评估读数的呈现结论（含人工裁决覆盖）。
+
+    候选证书快照统一做 as-of 投影；裁决依据里的候选同样以裁决 base_version
+    视角投影，保证历史版本取证包不携带任何"未来"事件，内容与摘要恒定。
+    取证包条目不单独携带 adjudication 字段（沿用既有包字段与 audit-v1 摘要规则）。
+    """
+    return evaluate_reading_presented(
+        conn, reading, at_version, snapshot_fn=_audit_snapshot_fn,
+        with_adjudication=False,
     )
-    return {"status": status, "reliance": candidates[0], "candidates": candidates}
 
 
 def _audit_canonical_rules() -> Dict[str, Any]:
@@ -764,9 +1041,7 @@ def _audit_filter_object(
 
 
 def _audit_item(conn: sqlite3.Connection, r: sqlite3.Row, at_version: int) -> Dict[str, Any]:
-    conclusion = _evaluate_reading_as_of(
-        conn, r["device_no"], r["measured_at"], r["value"], at_version
-    )
+    conclusion = _evaluate_reading_as_of(conn, r, at_version)
     return {
         "reading_no": r["reading_no"],
         "device_no": r["device_no"],

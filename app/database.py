@@ -19,7 +19,7 @@ PRAGMA foreign_keys=ON;
 -- 全局单调版本流水：每次成功变更产生一条记录，version 由 INTEGER PRIMARY KEY 自增
 CREATE TABLE IF NOT EXISTS versions (
     version                INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_type             TEXT NOT NULL CHECK (event_type IN ('cert_issue','cert_correct','cert_revoke','reading_submit')),
+    event_type             TEXT NOT NULL CHECK (event_type IN ('cert_issue','cert_correct','cert_revoke','reading_submit','reading_adjudicate')),
     request_id             TEXT NOT NULL UNIQUE,
     request_payload_json   TEXT NOT NULL,
     fingerprint            TEXT NOT NULL,
@@ -65,7 +65,58 @@ CREATE TABLE IF NOT EXISTS readings (
     created_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_readings_device_time ON readings(device_no, measured_at);
+
+-- 读数人工选证裁决（只追加，永不覆盖；同一读数可随生命周期多次裁决）
+-- 一次成功裁决占用一个全局版本；所依证书版本日后被纠正 / 撤销时
+-- 在 invalidated_at_version 登记失效，读数自动回到原自动结论，行仍保留。
+CREATE TABLE IF NOT EXISTS reading_adjudications (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    reading_no                TEXT NOT NULL REFERENCES readings(reading_no),
+    decided_at_version        INTEGER NOT NULL UNIQUE REFERENCES versions(version),
+    base_version              INTEGER NOT NULL,
+    selected_certificate_no   TEXT NOT NULL,
+    selected_version_seq      INTEGER NOT NULL,
+    reason                    TEXT,
+    invalidated_at_version    INTEGER,  -- 所选版本日后被纠正/撤销失效时登记；裁决行本身不可变
+    UNIQUE (reading_no, decided_at_version)
+);
+CREATE INDEX IF NOT EXISTS idx_adjudication_reading
+    ON reading_adjudications(reading_no, decided_at_version);
 """
+
+
+def _migrate_versions_event_type(conn: sqlite3.Connection) -> None:
+    """旧库 versions.event_type 的 CHECK 不含 reading_adjudicate 时，重建表升级约束。
+
+    历史只追加：数据逐行搬迁，version 主键与 request_id 唯一约束保持不变；
+    新库（CREATE TABLE IF NOT EXISTS 已带上新 CHECK）无需迁移。
+    """
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='versions'"
+    ).fetchone()
+    if ddl is not None and "reading_adjudicate" in (ddl["sql"] or ""):
+        return
+    conn.executescript(
+        """
+        PRAGMA foreign_keys=OFF;
+        ALTER TABLE versions RENAME TO versions_legacy;
+        CREATE TABLE versions (
+            version                INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type             TEXT NOT NULL CHECK (event_type IN ('cert_issue','cert_correct','cert_revoke','reading_submit','reading_adjudicate')),
+            request_id             TEXT NOT NULL UNIQUE,
+            request_payload_json   TEXT NOT NULL,
+            fingerprint            TEXT NOT NULL,
+            response_json          TEXT,
+            created_at             TEXT NOT NULL
+        );
+        INSERT INTO versions (version, event_type, request_id, request_payload_json,
+                              fingerprint, response_json, created_at)
+        SELECT version, event_type, request_id, request_payload_json,
+               fingerprint, response_json, created_at FROM versions_legacy;
+        DROP TABLE versions_legacy;
+        PRAGMA foreign_keys=ON;
+        """
+    )
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -86,6 +137,8 @@ def init_db() -> None:
     conn = _connect(get_settings().db_path)
     try:
         conn.executescript(SCHEMA)
+        # 旧库升级：versions.event_type CHECK 需要包含 reading_adjudicate
+        _migrate_versions_event_type(conn)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
     finally:
