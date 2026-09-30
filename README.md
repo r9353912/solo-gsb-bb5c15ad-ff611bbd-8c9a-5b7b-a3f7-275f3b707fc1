@@ -12,6 +12,7 @@
   - 唯一匹配且数值在闭区间内 → `conforming`（合格）
   - 唯一匹配但数值超出闭区间 → `out_of_range`（超限）
 - 撤销 / 纠正会改变当前受影响读数的结论，并在响应中给出前后对照；旧版本的结论与所依证书仍可随时查询。
+- `review` 读数支持**人工选证裁决**：提交所选证书编号+版本序号、依据的当前全局版本与理由；成功占用一个全局版本，按闭区间给出 `conforming`/`out_of_range` 并保留全部候选。所选证书版本日后被纠正/撤销时裁决自动失效、回落原自动结论；旧版本仍可查原裁决，取证包对应版本内容与摘要不变。
 - **幂等**：相同 `request_id` + 相同内容重复提交不产生新版本（返回首次结果，`idempotent_replay=true`）；`request_id` 复用但内容不同返回 `409`；无效区间 / 未知目标返回 `422` / `404`，单事务保证不留下任何部分变更。
 
 ---
@@ -224,9 +225,82 @@ curl -s http://localhost:8080/api/v1/health
 curl -s http://localhost:8080/api/v1/status
 ```
 
-### 8. 审计取证追溯包
+### 8. 待复核读数的人工选证裁决
 
-按**设备编号 + 带时区测量时间左闭右开区间 + 已提交版本**生成取证包（只读，不产生新版本）。包内只收录该版本**之前（含该版本）已提交**的读数，每条给出在该版本视角的结论 `status` 与**全部候选证书快照** `candidates`。
+处于 `review`（同一测量时刻有多份有效证书）的读数支持**人工选证裁决**：提交 `request_id`、读数编号、所选证书编号及版本序号、所依据的**当前全局版本**（`basis_version`）与理由。服务端按所选证书版本与读数数值做**闭区间**判定，给出 `conforming` / `out_of_range`。
+
+先取得当前全局版本（也可直接用读数查询响应里的 `at_version`）：
+
+```bash
+curl -s http://localhost:8080/api/v1/status
+# -> {"current_version": 6, ...}
+```
+
+提交裁决（本例测量值 140，选择区间含 140 的第二份候选证书）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/readings/adjudications \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_id": "req-adj-001",
+    "reading_no": "M-1",
+    "certificate_no": "CERT-002",
+    "version_seq": 1,
+    "basis_version": 6,
+    "reason": "经核实该读数按 CERT-002 校准计量"
+  }'
+```
+
+成功返回（节选）：
+
+```json
+{
+  "version": 7,
+  "request_id": "req-adj-001",
+  "event_type": "reading_adjudication",
+  "idempotent_replay": false,
+  "reading_no": "M-1",
+  "decision": "conforming",
+  "basis_version": 6,
+  "selected_certificate_no": "CERT-002",
+  "selected_version_seq": 1,
+  "reading": {
+    "reading_no": "M-1", "value": 140.0, "at_version": 7,
+    "status": "conforming",
+    "reliance": { "certificate_no": "CERT-002", "version_seq": 1, "...": "..." },
+    "candidates": [ { "...全部候选证书仍完整保留..." : "..." } ],
+    "adjudication": {
+      "request_id": "req-adj-001",
+      "at_version": 7,
+      "basis_version": 6,
+      "certificate_no": "CERT-002",
+      "version_seq": 1,
+      "decision": "conforming",
+      "reason": "经核实该读数按 CERT-002 校准计量",
+      "state": "effective",
+      "invalidated": false,
+      "invalidated_at_version": null,
+      "selected_certificate": { "...所选证书版本快照..." : "..." }
+    }
+  }
+}
+```
+
+规则要点：
+
+- **成功裁决占用一个全局版本**（事件类型 `reading_adjudication`）；裁决只追加，全部候选证书始终保留在 `candidates` 中。
+- **拒绝不产生新版本**（单事务整体回滚）：
+  - `basis_version` 不等于裁决时的当前全局版本 → `409 stale_basis_version`（防止基于陈旧视角裁决，重新拉取读数后再试）；
+  - 读数在依据版本视角下不是 `review`（含已存在生效裁决）→ `409 reading_not_in_review` / `409 reading_already_adjudicated`；
+  - 所选证书 / 版本序号不存在 → `404 unknown_certificate` / `404 unknown_certificate_version`；
+  - 所选版本**不是该读数测量时刻在依据版本视角下的候选证书**（目标不符）→ `422 certificate_not_candidate`。
+- **幂等**：相同 `request_id` + 相同内容重复提交沿用首次结果（`idempotent_replay=true`，不产生新版本）；相同 `request_id` 异内容 → `409 request_id_conflict`。
+- **失效与回落**：所选证书版本日后被**纠正**或**撤销**而失效时，读数自动回到原有自动结论（如重新 `review`），`adjudication.state` 标为 `invalidated` 并给出 `invalidated_at_version`；失效后读数重新处于 `review` 时可再次裁决。裁决记录只追加，**旧版本视角仍可查到原裁决**（`GET /readings/{no}?at_version=`）。
+- 读数查询、读数列表均按版本视角呈现裁决后结论与 `adjudication`（含 `state`）；`status` 过滤按裁决后结论生效。
+
+### 9. 审计取证追溯包
+
+按**设备编号 + 带时区测量时间左闭右开区间 + 已提交版本**生成取证包（只读，不产生新版本）。包内只收录该版本**之前（含该版本）已提交**的读数，每条给出在该版本视角的结论 `status`、**全部候选证书快照** `candidates`，以及版本视角下的人工裁决信息 `adjudication`（无裁决为 `null`，裁决失效按该版本视角如实呈现）。
 
 ```bash
 curl -s -G http://localhost:8080/api/v1/audit/packages \
@@ -260,7 +334,8 @@ curl -s -G http://localhost:8080/api/v1/audit/packages \
       "submitted_at_version": 2,
       "status": "conforming",
       "reliance": { "certificate_no": "CERT-001", "version_seq": 1, "...": "..." },
-      "candidates": [ { "certificate_no": "CERT-001", "version_seq": 1, "...": "..." } ]
+      "candidates": [ { "certificate_no": "CERT-001", "version_seq": 1, "...": "..." } ],
+      "adjudication": null
     }
   ],
   "digest": {
@@ -281,6 +356,7 @@ curl -s -G http://localhost:8080/api/v1/audit/packages \
 - **版本越界**（`at_version<1` 或 `>当前版本`）、**无效时间区间**（含缺时区、起点 ≥ 终点）一律 `422`，不读取数据、不产生半成品。
 - 大量条目用 `limit`（≤200）/`offset` 分段；固定按 `(measured_at ASC, reading_no ASC)` 排序，拼接无遗漏、无重复。各分段的 `package_id` 与 `package_digest` 完全一致（包摘要始终覆盖全部 `total_count` 条），另给 `segment_digest` 校验本分段。
 - 包生成在单一只读快照事务内完成；生成期间发生的新提交、证书纠正或撤销对该次取证不可见，且因只收录 `submitted_at_version <= at_version` 的读数、结论按 `at_version` 视角评估，**相同条件 + 版本的内容与摘要在任何时刻重取都一致**。
+- **裁决随版本视角呈现且不可变**：裁决生效时条目 `status` 为裁决结论（`conforming`/`out_of_range`）、`adjudication.state="effective"`；若该版本视角下所选证书版本已被纠正/撤销，则回落自动结论、`state="invalidated"` 并带 `invalidated_at_version`；`candidates` 始终保留全部候选。裁决只追加、取证条目按版本固定，后续纠正/撤销/重新裁决**不会改变旧版本包的对应版本内容与摘要**（仍沿用 `audit-v1` 摘要规则，仅在条目固定键集合中增加 `adjudication`，随包 `canonical_rules.adjudication_rules` 说明）。
 
 独立复算摘要（任何语言均可）：
 
@@ -311,6 +387,7 @@ PY
 | GET  | `/api/v1/certificates/{cert_no}` | 证书当前/指定版本视角内容 |
 | GET  | `/api/v1/certificates/{cert_no}/history` | 证书版本历史 |
 | POST | `/api/v1/readings` | 批量提交读数（读数不可变） |
+| POST | `/api/v1/readings/adjudications` | review 读数人工选证裁决（占用一个全局版本） |
 | GET  | `/api/v1/readings` | 读数列表（`at_version` / `device_no` / `status` / 分页） |
 | GET  | `/api/v1/readings/{reading_no}` | 读数结论（默认当前版本，`at_version` 查历史） |
 | GET  | `/api/v1/versions` | 全局单调版本流水 |
@@ -318,14 +395,15 @@ PY
 | GET  | `/api/v1/audit/packages` | 审计取证追溯包（设备 + 左闭右开时间区间 + 版本） |
 | GET  | `/api/v1/health` | 健康检查 |
 
-主要状态码：`200` 成功；`404` 未知目标（证书 / 读数 / 请求）；`409` 请求标识冲突、证书已存在 / 已撤销、读数已存在；`422` 参数校验失败（含无效时间区间、范围倒置、缺时区等）。
+主要状态码：`200` 成功；`404` 未知目标（证书 / 证书版本序号 / 读数 / 请求）；`409` 请求标识冲突、证书已存在 / 已撤销、读数已存在、裁决依据版本过期 / 读数非 review / 已有生效裁决；`422` 参数校验失败（含无效时间区间、范围倒置、缺时区、所选证书不是该读数候选等）。
 
 ---
 
 ## 七、设计要点
 
-- **单调整局版本**：`versions` 表自增主键，四类事件 `cert_issue / cert_correct / cert_revoke / reading_submit` 全部追加，记录请求体、指纹与响应快照。
+- **单调整局版本**：`versions` 表自增主键，五类事件 `cert_issue / cert_correct / cert_revoke / reading_submit / reading_adjudication` 全部追加，记录请求体、指纹与响应快照。
 - **历史不可覆盖**：证书内容存为只追加的 `certificate_versions`，纠正 / 撤销仅在旧行登记 `superseded_at_version`；读数只追加。
+- **人工选证裁决**：裁决存于只追加的 `reading_adjudications`（读数、所选证书编号+版本序号、依据版本、闭区间结论、理由、生效版本）。裁决是否失效**完全派生**自所选证书版本的 `superseded_at_version`——纠正 / 撤销无需回写裁决表，因此版本视角天然正确：裁决版本前 `adjudication=null`，裁决生效区间覆盖为裁决结论，所选版本被纠正/撤销后回落自动结论并标 `invalidated`；读数查询、列表、取证包共用同一套"版本视角叠加层"。提交时强校验 `basis_version=当前版本` 且所选版本为该读数测量时刻的候选，拒绝整事务回滚、不产生新版本。
 - **版本视角查询**：证书在版本 V 有效 ⇔ 其内容版本 `created_at_version <= V` 且（`superseded_at_version` 为空或 `> V`），且测量时刻落在 `[valid_from, valid_to)`。
 - **事务与并发**：所有写操作在单条 `BEGIN IMMEDIATE` 事务内完成「幂等判定 → 业务校验 → 落库」，任何错误整体回滚；WAL 模式支持读写并发。
 - **幂等指纹**：对归一化（UTC 化）后的请求体做排序 JSON 指纹；相同 `request_id` + 指纹返回首次响应，`request_id` 复用且指纹不同则拒绝。
@@ -340,4 +418,4 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-测试通过 TestClient 覆盖：四种结论、左闭右开边界、纠正 / 撤销的结论联动、旧版本可追溯、幂等重放、标识冲突、无效区间、未知目标、批次部分变更防护与多时区归一化。
+测试通过 TestClient 覆盖：四种结论、左闭右开边界、纠正 / 撤销的结论联动、旧版本可追溯、幂等重放、标识冲突、无效区间、未知目标、批次部分变更防护、多时区归一化，以及人工选证裁决全流程（依据版本过期 / 目标不符拒绝且不产生新版本、成功裁决覆盖结论并保留全部候选、幂等与冲突、纠正 / 撤销后裁决失效回落与重新裁决、按版本呈现、取证包内容与摘要稳定性、旧库 CHECK 约束迁移）。

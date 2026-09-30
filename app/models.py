@@ -123,3 +123,19 @@ class ReadingSubmitRequest(BaseModel):
         if len(set(nos)) != len(nos):
             raise ValueError("duplicate reading_no within the same request")
         return self
+
+
+class ReadingAdjudicateRequest(BaseModel):
+    """对处于 review 的读数进行人工选证裁决。
+
+    - certificate_no/version_seq 指定所选候选证书版本；
+    - basis_version 为提交方所依据的当前全局版本，与服务端当前版本不符则拒绝；
+    - 闭区间判定由服务端按所选证书版本与读数数值作出（conforming/out_of_range）。
+    """
+
+    request_id: str = Field(min_length=1, max_length=128)
+    reading_no: str = Field(min_length=1, max_length=128)
+    certificate_no: str = Field(min_length=1, max_length=128)
+    version_seq: int = Field(ge=1)
+    basis_version: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=512)

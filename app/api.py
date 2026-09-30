@@ -12,6 +12,7 @@ from .models import (
     CertCorrectRequest,
     CertIssueRequest,
     CertRevokeRequest,
+    ReadingAdjudicateRequest,
     ReadingSubmitRequest,
     UtcDatetime,
 )
@@ -27,11 +28,19 @@ def health() -> dict:
 
 @router.get("/status")
 def status() -> dict:
-    """服务总览：当前单调版本与结论枚举。"""
+    """服务总览：当前单调版本、结论枚举、裁决状态与事件类型。"""
     with get_conn() as conn:
         return {
             "current_version": service.current_version(conn),
             "conclusion_statuses": list(service.CONCLUSIONS),
+            "adjudication_states": list(service.ADJUDICATION_STATES),
+            "event_types": [
+                "cert_issue",
+                "cert_correct",
+                "cert_revoke",
+                "reading_submit",
+                "reading_adjudication",
+            ],
         }
 
 
@@ -97,6 +106,17 @@ def certificate_history(certificate_no: str) -> dict:
 @router.post("/readings")
 def submit_readings(req: ReadingSubmitRequest) -> dict:
     return service.submit_readings(req.model_dump())
+
+
+@router.post("/readings/adjudications")
+def adjudicate_reading(req: ReadingAdjudicateRequest) -> dict:
+    """对处于 review 的读数进行人工选证裁决。
+
+    提交 request_id、读数编号、所选证书编号及版本序号、所依据的当前全局版本
+    与理由。成功占用一个全局版本；所选版本必须是该读数测量时刻在依据版本
+    视角下的候选证书，依据版本必须等于当前版本，否则拒绝且不产生新版本。
+    """
+    return service.adjudicate_reading(req.model_dump())
 
 
 @router.get("/readings")

@@ -19,7 +19,9 @@ PRAGMA foreign_keys=ON;
 -- 全局单调版本流水：每次成功变更产生一条记录，version 由 INTEGER PRIMARY KEY 自增
 CREATE TABLE IF NOT EXISTS versions (
     version                INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_type             TEXT NOT NULL CHECK (event_type IN ('cert_issue','cert_correct','cert_revoke','reading_submit')),
+    event_type             TEXT NOT NULL CHECK (event_type IN ('cert_issue','cert_correct',
+                                           'cert_revoke','reading_submit',
+                                           'reading_adjudication')),
     request_id             TEXT NOT NULL UNIQUE,
     request_payload_json   TEXT NOT NULL,
     fingerprint            TEXT NOT NULL,
@@ -65,6 +67,25 @@ CREATE TABLE IF NOT EXISTS readings (
     created_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_readings_device_time ON readings(device_no, measured_at);
+
+-- 读数人工选证裁决（只追加）：针对处于 review 的读数，人工指定一个候选证书版本。
+-- 裁决是否失效不在此表登记：完全由所选证书版本的 superseded_at_version 派生，
+-- 因此历史版本视角下的裁决状态天然准确，纠正/撤销不需要回写本表。
+CREATE TABLE IF NOT EXISTS reading_adjudications (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    reading_no            TEXT NOT NULL REFERENCES readings(reading_no),
+    certificate_no        TEXT NOT NULL,
+    certificate_seq       INTEGER NOT NULL,
+    basis_version         INTEGER NOT NULL REFERENCES versions(version),  -- 裁决所依据的当前全局版本
+    decision              TEXT NOT NULL CHECK (decision IN ('conforming','out_of_range')),
+    reason                TEXT NOT NULL,
+    created_at_version    INTEGER NOT NULL REFERENCES versions(version),  -- 裁决生效版本
+    UNIQUE (id),
+    FOREIGN KEY (certificate_no, certificate_seq)
+        REFERENCES certificate_versions(certificate_no, version_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_adjudications_reading
+    ON reading_adjudications(reading_no, created_at_version);
 """
 
 
@@ -88,8 +109,61 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        _migrate_event_type_check(conn)
     finally:
         conn.close()
+
+
+def _migrate_event_type_check(conn: sqlite3.Connection) -> None:
+    """把旧库 versions.event_type 的 CHECK 扩展为包含 reading_adjudication。
+
+    SQLite 无法直接 ALTER 约束：旧库（仅四个事件类型的 CHECK）需要重建
+    versions 表。表本身不大（每个写请求一行），在事务内一次性完成；
+    新建库的 CHECK 已含新事件类型，无需重建。
+    """
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='versions'"
+    ).fetchone()["sql"]
+    if "reading_adjudication" in sql:
+        return
+    # foreign_keys 不能在事务内切换；迁移期间临时关闭（此时连接刚建立、无其他事务）
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 保留子表（certificates/readings 等）中对 "versions" 的外键引用名：
+        # 3.26+ 默认会把引用改写为 versions_old，打开 legacy 开关禁止该行为。
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        conn.execute("ALTER TABLE versions RENAME TO versions_old")
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+        conn.execute(
+            "CREATE TABLE versions ("
+            "version INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "event_type TEXT NOT NULL CHECK (event_type IN "
+            "('cert_issue','cert_correct','cert_revoke','reading_submit',"
+            "'reading_adjudication')),"
+            "request_id TEXT NOT NULL UNIQUE,"
+            "request_payload_json TEXT NOT NULL,"
+            "fingerprint TEXT NOT NULL,"
+            "response_json TEXT,"
+            "created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO versions (version, event_type, request_id,"
+            " request_payload_json, fingerprint, response_json, created_at)"
+            " SELECT version, event_type, request_id, request_payload_json,"
+            " fingerprint, response_json, created_at FROM versions_old"
+        )
+        conn.execute("DROP TABLE versions_old")
+        conn.execute("COMMIT")
+        # 立即对整个库做一次外键完整性校验，再恢复连接的外键开关
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(f"foreign key integrity check failed: {violations!r}")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except Exception:
+        conn.execute("ROLLBACK")
+        conn.execute("PRAGMA foreign_keys=ON")
+        raise
 
 
 @contextmanager
